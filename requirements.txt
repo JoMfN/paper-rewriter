@@ -1,0 +1,29 @@
+# Core LLM & tooling
+openai>=1.40.0,<2.0.0
+tiktoken>=0.7.0,<1.0.0
+
+# Retrieval / embeddings
+chromadb>=0.5.3,<1.0.0
+sentence-transformers>=3.0.1,<4.0.0
+# NOTE: Install a Torch build appropriate for your system if this default fails
+# (see https://pytorch.org/get-started). You may pin a CUDA/MPS wheel instead.
+torch>=2.2.0
+
+# Document parsing
+python-docx>=1.1.2,<2.0.0
+pdfminer.six>=20231228
+pypdf>=4.2.0,<5.0.0
+html2text>=2024.2.26,<2025.0.0
+markdown-it-py>=3.0.0,<4.0.0
+
+# Nice-to-have console output
+rich>=13.7.1,<14.0.0
+
+# Optional: raw HTTP + SSE streaming compatibility for local OpenAI-style servers
+requests>=2.31.0,<3.0.0
+sseclient-py>=1.8.0,<2.0.0
+
+# (Optional) For compatibility with older prototype scripts using LangChain
+langchain>=0.2.10,<0.3.0
+langchain-community>=0.2.10,<0.3.0
+PyPDF2>=3.0.1,<4.0.0
