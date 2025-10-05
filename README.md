@@ -202,4 +202,4 @@ python paper_rewriter_plus.py process \
 ---
 
 ## License
-MIT
+Licensed under the [MIT License](LICENSE).
