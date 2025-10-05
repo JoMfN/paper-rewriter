@@ -25,8 +25,6 @@ Robust, model-agnostic toolkit to rewrite/summarize/extract academic content wit
 └── outputs/                        # generated text outputs (created on process)
 ```
 
-> If your canvas shows a file called **“Paper Rewriter Plus (token-aware RAG fix)”**, it’s the same script content ready to save as `paper_rewriter_plus.py`.
-
 ---
 
 ## Installation
