@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Paper Rewriter Plus — model/RAG-ready academic rewriter (local LLM + Chroma + streaming)
----------------------------------------------------------------------------------------
+Paper Rewriter Plus V2 — model/RAG-ready academic rewriter (local LLM + Chroma + streaming + guidelines)
+-------------------------------------------------------------------------------------------------------
 
 What this tool does
 - Reads .docx, .pdf, .md/.txt, or .html and extracts clean text (heading-aware)
@@ -9,26 +9,33 @@ What this tool does
 - Runs one or more tasks (rewrite, review, extract, outline, figure suggestions, etc.)
 - Optional RAG: retrieves top-k snippets from a ChromaDB index and injects them per chunk
 - Supports OpenAI cloud and OpenAI-compatible localhost servers (vLLM, Ollama, LM Studio, oobabooga WebUI)
-- Optional streaming for interactive runs (default OFF)
+- Optional streaming for interactive runs
+- **New:** General paper-writing **guidelines** system (built-in + overridable via `--guidelines_file`), and guided tasks
 
 Install
     pip install -U "openai>=1.40.0" tiktoken>=0.7.0 chromadb>=0.5.3 sentence-transformers>=3.0.1
     pip install -U python-docx>=1.1.2 pdfminer.six>=20231228 html2text>=2024.2.26 markdown-it-py>=3.0.0
     pip install -U rich>=13.7.1 pypdf>=4.2.0
+    # Recommended for cleaner PDF extraction
+    pip install -U PyMuPDF>=1.24.1
 
 Local endpoint example (Ollama / oobabooga / vLLM)
     export OPENAI_API_KEY=sk-local
     export OPENAI_BASE_URL=http://127.0.0.1:5000/v1
 
 RAG ingest
-    python paper_rewriter_plus.py ingest --inputs ./input_pdfs --chroma_path ./ragdb --collection papers --embed_model "BAAI/bge-large-en-v1.5" --chunk_chars 1000 --chunk_overlap 30 --embed_token_limit 480
+    python paper_rewriter_plusV2.py ingest --inputs ./input_pdfs --chroma_path ./ragdb --collection papers \
+      --embed_model "BAAI/bge-large-en-v1.5" --chunk_chars 1000 --chunk_overlap 30 --embed_token_limit 480 --pdf_extractor auto
 
 Process with multiple tasks + RAG
-    python paper_rewriter_plus.py process --input my_paper.pdf --outdir outputs --task rewrite_academic --task figure_suggestions --rag --k 6 --context_tokens 1200 --chroma_path ./ragdb --collection papers --model gpt-4o-mini
+    python paper_rewriter_plusV2.py process --input my_paper.pdf --outdir outputs \
+      --task rewrite_academic_guided --task figure_suggestions --rag --k 6 --context_tokens 1200 \
+      --chroma_path ./ragdb --collection papers --model gpt-4o-mini --stream --guidelines_file Writing_a_Paper_I-JS.txt
 
 Notes
 - The similarity percentage (--similarity) is a rough n-gram overlap proxy, not a plagiarism score.
-- Streaming (--stream) improves UX but not quality; default OFF to keep batch outputs stable.
+- Streaming (--stream) improves UX but not quality.
+- Use `--pdf_extractor pymupdf` for quieter, often cleaner PDF text.
 """
 
 from __future__ import annotations
@@ -44,7 +51,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-logger = logging.getLogger('paper_rewriter_plus')
+logger = logging.getLogger('paper_rewriter_plusV2')
+
+# Silence noisy pdfminer warnings (e.g., gray non-stroke color ...)
+for _name in (
+    'pdfminer', 'pdfminer.image', 'pdfminer.pdfinterp', 'pdfminer.converter', 'pdfminer.cmapdb', 'pdfminer.layout'
+):
+    logging.getLogger(_name).setLevel(logging.ERROR)
 
 # ---------- Tokenization ----------
 try:
@@ -87,9 +100,14 @@ except Exception:
     _html2text = None
 
 try:
-    from pypdf import PdfReader  # fallback
+    from pypdf import PdfReader
 except Exception:
     PdfReader = None
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 
 # ---------- RAG: ChromaDB + Sentence-Transformers ----------
 try:
@@ -104,22 +122,56 @@ try:
 except Exception:
     SentenceTransformer = None
 
-# ---------- Prompt Library (domain-agnostic) ----------
+# ---------- Paper-writing Guidelines (general, journal-style) ----------
+_DEFAULT_GUIDELINES = (
+    "STYLE\n"
+    "• One idea per sentence; prefer short, direct sentences.\n"
+    "• Guide the reader; repeat for clarity when helpful.\n"
+    "• Avoid unsubstantiated superlatives; justify or soften claims.\n"
+    "• Use careful language for uncertainty (e.g., results suggest, provide evidence).\n"
+    "• Quantify statements when possible (e.g., AUROC>0.98; Δ=10±2%; p=0.001).\n"
+    "• Do not overinterpret beyond measurements; be cautious about causality.\n"
+    "• Neutral, collegial comparisons with prior work; highlight added insight.\n"
+    "\nABSTRACT (structured)\n"
+    "• Background/Purpose: method, key parameters, problem (1–2 sentences).\n"
+    "• Methods: sample size and major techniques.\n"
+    "• Results: past tense; include key numbers supporting conclusions.\n"
+    "• Conclusion: take-home message and essential numbers.\n"
+    "\nRESULTS\n"
+    "• Past tense; order by figure numbering.\n"
+    "• Start from completeness→key findings with numbers (means±SD/CI, % changes, p-values).\n"
+    "• Ensure abstract numbers appear and match.\n"
+    "\nMETHODS\n"
+    "• Past tense. Order: subjects/ethics → materials → experimental methods → statistics.\n"
+    "\nDISCUSSION\n"
+    "• Concise; one paragraph per point. Significance → novelty/enablers → compare → limitations → brief summary.\n"
+    "\nINTRODUCTION\n"
+    "• Write last. Background + unmet need (2–3 sentences), cite generously, state hypothesis, enumerate aims.\n"
+)
+
+# ---------- Prompt Library (domain-agnostic + guided) ----------
 @dataclass
 class PromptLibrary:
+    GUIDELINES: str = _DEFAULT_GUIDELINES
+
     SYSTEM_RESEARCH_ASSISTANT: str = (
         "You are a meticulous research assistant and scientific writing editor. "
-        "You write in clear academic prose, keep claims precise, avoid hallucinations, "
-        "and add TODO-style citation markers [n] where external sources are needed."
+        "Write in clear academic prose, keep claims precise, avoid hallucinations. "
+        "Follow the writing rules below strictly.\n\n" + _DEFAULT_GUIDELINES
     )
 
     TASKS: Dict[str, str] = dataclasses.field(default_factory=lambda: {
+        # General rewrite
         'rewrite_academic': (
             "Rewrite the provided section into a coherent, engaging academic text in active voice. "
             "Keep technical accuracy; avoid assumptions not supported by the input. "
             "Preserve all core facts; improve organization and readability. "
-            "Insert citation markers as [1], [2] where claims need support. "
-            "Use LaTeX math mode for equations if present."
+            "Insert citation markers as [1], [2] where claims need support. If equations appear, use LaTeX math mode."
+        ),
+        # Guided rewrite that enforces journal-style rules
+        'rewrite_academic_guided': (
+            "Apply the following journal-style writing rules to the rewrite.\n\n{GUIDELINES}\n\n"
+            "Return only the polished text; keep one idea per sentence; add [n] markers where citations are required."
         ),
         'edit_and_review': (
             "Fix grammar and style; propose a concise, informative section title. "
@@ -145,6 +197,26 @@ class PromptLibrary:
         ),
         'peer_review': (
             "Provide a reviewer-style critique grouped into Major Issues, Minor Issues, and Typos/Edits."
+        ),
+        # Section-specific drafting tasks using guidelines
+        'draft_abstract_structured': (
+            "Draft a structured abstract strictly following these rules:\n\n{GUIDELINES}\n\n"
+            "Sections: Background/Purpose, Methods, Results (past tense, ALL key numbers), Conclusion (take-home message)."
+        ),
+        'draft_introduction_guided': (
+            "Write an Introduction that opens with background + unmet need (2–3 sentences), cites generously, states the hypothesis, and enumerates aims.\n\nApply:\n{GUIDELINES}"
+        ),
+        'draft_methods_guided': (
+            "Write a Methods section in past tense with this order: subjects/ethics → materials → experimental methods → statistics.\n\nApply:\n{GUIDELINES}"
+        ),
+        'draft_results_guided': (
+            "Write a Results section in past tense, ordered by figure numbering. Include quantitative values (means±SD/CI, % changes, p-values). Ensure all abstract numbers appear and match.\n\nApply:\n{GUIDELINES}"
+        ),
+        'draft_discussion_guided': (
+            "Write a concise Discussion: significance → novelty/enablers → compare to literature → limitations → brief summary that mirrors the abstract.\n\nApply:\n{GUIDELINES}"
+        ),
+        'draft_conclusion_guided': (
+            "Write a short Conclusion that reiterates the take-home message and the essential quantitative findings.\n\nApply:\n{GUIDELINES}"
         ),
     })
 
@@ -230,19 +302,60 @@ def read_text_from_docx(path: Path) -> str:
     return '\n'.join(lines)
 
 
-def read_text_from_pdf(path: Path) -> str:
-    if pdf_extract_text is not None:
-        try:
-            return pdf_extract_text(str(path))
-        except Exception:
-            pass
-    if PdfReader is not None:
-        try:
-            r = PdfReader(str(path))
-            return '\n'.join(page.extract_text() or '' for page in r.pages)
-        except Exception:
-            raise
-    raise RuntimeError('No PDF reader available. Install pdfminer.six or pypdf')
+def _read_text_from_pdf_pymupdf(path: Path) -> Optional[str]:
+    if fitz is None:
+        return None
+    try:
+        with fitz.open(str(path)) as doc:
+            return "\n".join(page.get_text("text") for page in doc)
+    except Exception:
+        return None
+
+
+def _read_text_from_pdf_pdfminer(path: Path) -> Optional[str]:
+    if pdf_extract_text is None:
+        return None
+    try:
+        return pdf_extract_text(str(path))
+    except Exception:
+        return None
+
+
+def _read_text_from_pdf_pypdf(path: Path) -> Optional[str]:
+    if PdfReader is None:
+        return None
+    try:
+        r = PdfReader(str(path))
+        return '\n'.join(page.extract_text() or '' for page in r.pages)
+    except Exception:
+        return None
+
+
+def read_text_from_pdf_any(path: Path, extractor: str = 'auto') -> str:
+    """Robust PDF extractor. 'auto' tries PyMuPDF -> pdfminer.six -> pypdf."""
+    extractor = (extractor or 'auto').lower()
+    if extractor in {'pymupdf', 'fitz'}:
+        txt = _read_text_from_pdf_pymupdf(path)
+        if txt is not None:
+            return txt
+        raise RuntimeError('PyMuPDF requested but failed to extract text.')
+    if extractor == 'pdfminer':
+        txt = _read_text_from_pdf_pdfminer(path)
+        if txt is not None:
+            return txt
+        raise RuntimeError('pdfminer requested but failed to extract text.')
+    if extractor == 'pypdf':
+        txt = _read_text_from_pdf_pypdf(path)
+        if txt is not None:
+            return txt
+        raise RuntimeError('pypdf requested but failed to extract text.')
+
+    # auto mode
+    for fn in (_read_text_from_pdf_pymupdf, _read_text_from_pdf_pdfminer, _read_text_from_pdf_pypdf):
+        txt = fn(path)
+        if txt:
+            return txt
+    raise RuntimeError('No PDF extractor succeeded. Install PyMuPDF or pdfminer.six/pypdf.')
 
 
 def read_text_from_html(path: Path) -> str:
@@ -253,20 +366,20 @@ def read_text_from_html(path: Path) -> str:
     return _html2text.html2text(html_content)
 
 
-def read_text_generic(path: Path) -> str:
+def read_text_generic(path: Path, pdf_extractor: str = 'auto') -> str:
     s = path.suffix.lower()
     if s == '.docx':
         return read_text_from_docx(path)
     if s == '.pdf':
-        return read_text_from_pdf(path)
+        return read_text_from_pdf_any(path, extractor=pdf_extractor)
     if s in {'.html', '.htm'}:
         return read_text_from_html(path)
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         return f.read()
 
-# ---------- LLM call (OpenAI-compatible, optional streaming ready) ----------
+# ---------- LLM call (OpenAI-compatible, with optional streaming) ----------
 
-def call_chat_model(task_prompt: str, content: str, *, model: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200, stream: bool = False) -> str:
+def call_chat_model(task_prompt: str, content: str, *, model: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 11200, stream: bool = False) -> str:
     if _openai_client is None:
         raise RuntimeError('OpenAI-compatible client not initialized. Install openai and/or set OPENAI_BASE_URL.')
 
@@ -284,7 +397,7 @@ def call_chat_model(task_prompt: str, content: str, *, model: str, system_prompt
         )
         return (resp.choices[0].message.content or '').strip()
 
-    # Stream mode
+    # Stream mode (prints live while accumulating)
     resp = _openai_client.chat.completions.create(
         model=model,
         messages=messages,
@@ -326,7 +439,6 @@ def token_aware_chunks(text: str, tokenizer, max_tokens: int = 480) -> List[str]
     Greedy on sentence-ish/paragraph boundaries; hard-wraps only when necessary.
     """
     text = text or ''
-    # First split on paragraph/sentence boundaries
     parts = re.split(r"(?<=[\.!?])\s+|\n\n+", text)
     chunks: List[str] = []
     buf_txt = ''
@@ -346,7 +458,6 @@ def token_aware_chunks(text: str, tokenizer, max_tokens: int = 480) -> List[str]
         else:
             if buf_txt:
                 flush()
-            # If single part still too big, hard wrap by words
             if hf_token_len(tokenizer, p) > max_tokens:
                 words = p.split()
                 cur = []
@@ -374,7 +485,6 @@ class RAG:
             raise RuntimeError('RAG requested but chromadb/sentence-transformers are not installed.')
         self.enabled = True
         self.cfg = cfg
-        # Disable telemetry to avoid noisy warnings
         settings = _ChromaSettings(anonymized_telemetry=False) if _ChromaSettings else None
         self.client = chromadb.PersistentClient(path=str(cfg.chroma_path), settings=settings)
         self.collection = self.client.get_or_create_collection(name=cfg.collection)
@@ -430,14 +540,18 @@ def process_text(
     model: str,
     prompts: PromptLibrary,
     rag: Optional[RAG] = None,
-    max_context_tokens: int = 6000,
+    max_context_tokens: int = 16000,
     overlap_tokens: int = 200,
     include_similarity: bool = False,
     stream: bool = False,
 ) -> Tuple[str, List[str]]:
     if task_key not in prompts.TASKS:
         raise KeyError(f"Unknown task '{task_key}'. Options: {sorted(prompts.TASKS)}")
-    task_prompt = prompts.TASKS[task_key]
+
+    # Inject global guidelines into task prompt if placeholder present
+    raw_task = prompts.TASKS[task_key]
+    task_prompt = raw_task.replace('{GUIDELINES}', prompts.GUIDELINES)
+
     chunks = chunk_text(raw_text, model, max_tokens=max_context_tokens, overlap_tokens=overlap_tokens)
     outputs: List[str] = []
     logger.info("Processing %d chunks with '%s'%s...", len(chunks), task_key, ' + RAG' if rag and rag.enabled else '')
@@ -472,7 +586,7 @@ def run_figure_suggestions(text: str, *, model: str, prompts: PromptLibrary, rag
         model=model,
         prompts=prompts,
         rag=rag,
-        max_context_tokens=5500,
+        max_context_tokens=15500,
         overlap_tokens=150,
         include_similarity=False,
         stream=stream,
@@ -489,9 +603,9 @@ def safe_write(path: Path, content: str):
 
 # ---------- RAG: ingest and query utilities (CLI subcommands) ----------
 
-def _pdf_to_text(file_path: Path) -> str:
+def _pdf_to_text(file_path: Path, extractor: str = 'auto') -> str:
     try:
-        return read_text_from_pdf(file_path)
+        return read_text_from_pdf_any(file_path, extractor=extractor)
     except Exception:
         return ''
 
@@ -507,7 +621,7 @@ def _split_into_chunks(text: str, *, chunk_chars: int = 1500, chunk_overlap: int
     return [c.strip() for c in chunks if c.strip()]
 
 
-def rag_ingest(inputs: Path, *, chroma_path: Path, collection: str, embed_model: str, chunk_chars: int, chunk_overlap: int, embed_token_limit: Optional[int] = None):
+def rag_ingest(inputs: Path, *, chroma_path: Path, collection: str, embed_model: str, chunk_chars: int, chunk_overlap: int, embed_token_limit: Optional[int] = None, pdf_extractor: str = 'auto'):
     if chromadb is None or SentenceTransformer is None:
         raise RuntimeError('Install chromadb and sentence-transformers for ingestion.')
     settings = _ChromaSettings(anonymized_telemetry=False) if _ChromaSettings else None
@@ -529,7 +643,7 @@ def rag_ingest(inputs: Path, *, chroma_path: Path, collection: str, embed_model:
         logger.warning('No PDFs found in %s', inputs)
     for pdf in pdfs:
         logger.info('Ingesting %s', pdf.name)
-        text = _pdf_to_text(pdf)
+        text = _pdf_to_text(pdf, extractor=pdf_extractor)
         # Prefer token-aware chunks to ensure every embedded chunk <= model limit
         limit = embed_token_limit if (embed_token_limit and embed_token_limit > 0) else (tok_max - 32 if tok_max > 64 else max(tok_max - 4, 32))
         chunks = token_aware_chunks(text, embedder.tokenizer, max_tokens=limit)
@@ -570,8 +684,9 @@ def run_pipeline(
     prompts: PromptLibrary,
     rag_cfg: Optional[RAGConfig] = None,
     stream: bool = False,
+    pdf_extractor: str = 'auto',
 ):
-    text = read_text_generic(input_path)
+    text = read_text_generic(input_path, pdf_extractor=pdf_extractor)
     rag = RAG(rag_cfg) if (rag_cfg and rag_cfg.enabled) else None
 
     for task in tasks:
@@ -592,7 +707,7 @@ def run_pipeline(
 # ---------- CLI ----------
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='Paper Rewriter Plus — academic rewriting toolkit with RAG, local LLMs, and optional streaming')
+    p = argparse.ArgumentParser(description='Paper Rewriter Plus V2 — academic rewriting toolkit with RAG, local LLMs, streaming, and guidelines')
     sub = p.add_subparsers(dest='cmd', required=True)
 
     # process subcommand
@@ -603,6 +718,8 @@ def build_argparser() -> argparse.ArgumentParser:
     pp.add_argument('--model', default=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'), help='Model name (OpenAI or local)')
     pp.add_argument('--similarity', action='store_true', help='Append similarity proxy vs. source')
     pp.add_argument('--stream', action='store_true', help='Stream model output to stdout while accumulating result')
+    pp.add_argument('--pdf_extractor', choices=['auto','pymupdf','pdfminer','pypdf'], default='auto', help='PDF text extractor backend')
+    pp.add_argument('--guidelines_file', type=Path, help='Optional path to a text file with custom paper-writing guidelines')
     # RAG options
     pp.add_argument('--rag', action='store_true', help='Enable retrieval-augmented prompting from ChromaDB')
     pp.add_argument('--chroma_path', type=Path, default=Path('./ragdb'), help='ChromaDB persistent directory')
@@ -620,6 +737,7 @@ def build_argparser() -> argparse.ArgumentParser:
     pi.add_argument('--chunk_chars', type=int, default=1500)
     pi.add_argument('--chunk_overlap', type=int, default=200)
     pi.add_argument('--embed_token_limit', type=int, default=480, help='Max tokens per embedded chunk (<= model limit). Use ~480 for BGE-large.')
+    pi.add_argument('--pdf_extractor', choices=['auto','pymupdf','pdfminer','pypdf'], default='auto', help='PDF text extractor backend')
 
     # query subcommand
     pq = sub.add_parser('query', help='Query ChromaDB and print top snippets')
@@ -644,6 +762,7 @@ def main(argv: Optional[Sequence[str]] = None):
             chunk_chars=args.chunk_chars,
             chunk_overlap=args.chunk_overlap,
             embed_token_limit=args.embed_token_limit,
+            pdf_extractor=args.pdf_extractor,
         )
         return
 
@@ -671,6 +790,21 @@ def main(argv: Optional[Sequence[str]] = None):
                 logger.error("Unknown task '%s' (valid: %s)", t, sorted(valid))
                 sys.exit(2)
         prompts = PromptLibrary()
+        # Optional: load custom guidelines from file
+        if args.guidelines_file:
+            if not args.guidelines_file.exists():
+                logger.error('Guidelines file not found: %s', args.guidelines_file)
+                sys.exit(2)
+            try:
+                prompts.GUIDELINES = args.guidelines_file.read_text(encoding='utf-8')
+                prompts.SYSTEM_RESEARCH_ASSISTANT = (
+                    "You are a meticulous research assistant and scientific writing editor. "
+                    "Write in clear academic prose, keep claims precise, avoid hallucinations. "
+                    "Follow the writing rules below strictly.\n\n" + prompts.GUIDELINES
+                )
+            except Exception as e:
+                logger.error('Failed to read guidelines file: %s', e)
+                sys.exit(2)
         rag_cfg = None
         if args.rag:
             rag_cfg = RAGConfig(
@@ -690,6 +824,7 @@ def main(argv: Optional[Sequence[str]] = None):
             prompts=prompts,
             rag_cfg=rag_cfg,
             stream=args.stream,
+            pdf_extractor=args.pdf_extractor,
         )
         return
 
